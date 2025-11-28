@@ -1,0 +1,8 @@
+[package]
+name = "spofr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dialoguer = "0.12.0"
+pnet = "0.35.0"
