@@ -1,7 +1,13 @@
 [package]
 name = "spofr"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A network spoofing tool for educational purposes (ARP and DHCP)."
+license = "MIT"
+repository = "https://github.com/hotplugindev/spofr"
+readme = "README.md"
+keywords = ["arp", "dhcp", "spoofing", "network", "security"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 dialoguer = "0.12.0"
