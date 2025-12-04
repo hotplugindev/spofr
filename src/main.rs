@@ -1,11 +1,12 @@
 mod spoofing;
 mod wireless;
 mod cracking;
+mod starvation;
 
 use dialoguer::{theme::ColorfulTheme, Select};
 
 fn main() {
-    let selections = &["Wireless", "Spoof Attacks", "Cracking", "Exit"];
+    let selections = &["Wireless", "Spoof Attacks", "Cracking", "Starvation", "Exit"];
 
     println!("Welcome to Spofr - Educational Network Tool");
 
@@ -21,6 +22,7 @@ fn main() {
             "Wireless" => wireless_menu(),
             "Spoof Attacks" => spoof_attacks_menu(),
             "Cracking" => cracking_menu(),
+            "Starvation" => starvation_menu(),
             "Exit" => {
                 println!("Exiting...");
                 break;
@@ -86,6 +88,25 @@ fn cracking_menu() {
 
         match selections[selection] {
             "WLAN Capture Cracking" => cracking::wlan_capture_cracking::wlan_capture_cracking::run(),
+            "Back" => break,
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn starvation_menu() {
+    let selections = &["DHCP Starvation", "Back"];
+
+    loop {
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Starvation Menu")
+            .default(0)
+            .items(&selections[..])
+            .interact()
+            .unwrap();
+
+        match selections[selection] {
+            "DHCP Starvation" => starvation::dhcp_starvation::dhcp_starvation::run(),
             "Back" => break,
             _ => unreachable!(),
         }

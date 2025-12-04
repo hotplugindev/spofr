@@ -129,7 +129,24 @@ WPA/WPA2 handshake capture tool for password cracking preparation.
     *   Real-time capture monitoring.
     *   **Requires**: Monitor mode enabled, `aircrack-ng` suite installed.
 
-### 🔓 Cracking
+### 🍽️ Starvation Attacks
+ 
+ #### DHCP Starvation
+ Denial of Service (DoS) attack targeting DHCP servers.
+ 
+ *   **List Network Settings**: View interface details.
+ *   **Set Network Settings**:
+     *   **Interface Selection**: Choose target network interface.
+     *   **Attack Modes**:
+         *   **Simple**: Configurable delay between packets.
+         *   **Extreme Flooding**: Zero-delay packet flooding for maximum throughput.
+         *   **Full Starvation (DORA)**: Completes the full DHCP handshake (Discover-Offer-Request-Ack) to permanently lease IP addresses.
+ *   **Start Attack**:
+     *   Floods the network with DHCP Discover packets using randomized MAC addresses.
+     *   Exhausts the DHCP server's IP address pool, preventing legitimate clients from connecting.
+     *   **Requires**: `root` privileges.
+ 
+ ### 🔓 Cracking
 
 #### WLAN Capture Cracking
 WPA/WPA2 password recovery tool using captured handshakes.
@@ -231,6 +248,7 @@ This tool demonstrates:
 ✅ **WLAN Jammer** - WiFi deauthentication attack  
 ✅ **Auth Capture** - WPA/WPA2 handshake capture with active and passive modes  
 ✅ **WLAN Capture Cracking** - Password recovery with wordlist and brute force attacks
+✅ **DHCP Starvation** - DHCP pool exhaustion with multiple attack modes (Simple, Extreme, DORA)
 
 ## Contributing
 
